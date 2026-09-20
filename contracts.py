@@ -223,6 +223,7 @@ class ReviseRequest(TypedDict):
     conditions: list[str]
     source_evidence_refs: list[str]
     valid_from: str | None
+    request_id: NotRequired[str]
 
 
 class ForgetRequest(TypedDict):

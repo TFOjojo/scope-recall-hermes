@@ -1,6 +1,6 @@
 """Versioned target DDL. Only explicit initialization/maintenance executes this."""
 
-SCHEMA_VERSION = 1108
+SCHEMA_VERSION = 1109
 APPLICATION_ID = 0x5352434C
 
 WORK_ITEMS_STATEMENT = """CREATE TABLE work_items (
@@ -107,6 +107,21 @@ RECOVERY_STATEMENTS = (
         disposition TEXT NOT NULL, detail TEXT NOT NULL, recorded_at TEXT NOT NULL
     ) STRICT""",
 )
+
+# Idempotent revise-replay receipts (P2 write-contract gap). Defined as its own
+# named constant so both fresh-install initialization and the 1108->1109 upgrade
+# step use the identical statement object; IF NOT EXISTS keeps reruns harmless.
+MUTATION_RECEIPT_TABLE_STATEMENT = """CREATE TABLE IF NOT EXISTS mutation_receipts (
+    request_key TEXT PRIMARY KEY NOT NULL,
+    request_id TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    installation_id TEXT NOT NULL,
+    scope_id TEXT NOT NULL REFERENCES instance_scopes(scope_id),
+    project_id TEXT, branch_id TEXT,
+    claim_ref TEXT NOT NULL, claim_revision INTEGER NOT NULL CHECK(claim_revision>=1),
+    disposition TEXT NOT NULL, state TEXT NOT NULL,
+    created_at TEXT NOT NULL
+) STRICT"""
 
 STATEMENTS = (
     """CREATE TABLE instance_meta (
@@ -294,7 +309,18 @@ STATEMENTS = (
         PRIMARY KEY(object_kind,object_ref,object_revision,dependency_kind,dependency_ref,dependency_revision)
     ) STRICT, WITHOUT ROWID""",
     "CREATE INDEX object_dependents ON object_dependencies(dependency_kind,dependency_ref,dependency_revision)",
+    MUTATION_RECEIPT_TABLE_STATEMENT,
 ) + RECOVERY_STATEMENTS + CANDIDATE_STATEMENTS
+
+# Upgrade steps must name their own statements explicitly: a substring match
+# over STATEMENTS silently breaks whenever a table is added or its DDL wording
+# changes (an earlier "CREATE TABLE mutation_receipts" filter went silently
+# empty when the DDL gained IF NOT EXISTS, and the 1107->1109 upgrade then
+# produced a database with no receipts table). Derive from the same object.
+MUTATION_RECEIPT_STATEMENTS = (MUTATION_RECEIPT_TABLE_STATEMENT,)
+assert MUTATION_RECEIPT_STATEMENTS and all(
+    "mutation_receipts" in s for s in MUTATION_RECEIPT_STATEMENTS
+), "mutation receipt migration statements must not be empty"
 
 
 def upgrade_1105(connection):
@@ -367,5 +393,20 @@ def upgrade_1107(connection):
     connection.execute("DROP TABLE _r1_outcomes")
     for statement in CANDIDATE_STATEMENTS:
         connection.execute(statement)
-    connection.execute("UPDATE instance_meta SET schema_version=? WHERE singleton=1", (SCHEMA_VERSION,))
-    connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+    connection.execute("UPDATE instance_meta SET schema_version=1108 WHERE singleton=1")
+    connection.execute("PRAGMA user_version=1108")
+
+
+def upgrade_1108(connection):
+    """Install mutation request receipts for idempotent revise replay.
+
+    The caller owns the verified initialization transaction. The table only
+    stores committed outcomes; replays are read-only and never bump epochs.
+    Idempotent: the table DDL carries IF NOT EXISTS so a rerun over an already
+    upgraded database re-creates nothing, and the version writes below are
+    literal single-step advances that a retry can repeat harmlessly.
+    """
+    for statement in MUTATION_RECEIPT_STATEMENTS:
+        connection.execute(statement)
+    connection.execute("UPDATE instance_meta SET schema_version=1109 WHERE singleton=1")
+    connection.execute("PRAGMA user_version=1109")

@@ -557,8 +557,12 @@ class CodexMCPServer:
             body = _object(payload, allowed=frozenset({"protocol_version", "request_id", "target_ref", "expected_revision", "new_value", "conditions", "source_evidence_refs", "valid_from"}), required=frozenset({"protocol_version", "target_ref", "expected_revision", "new_value", "conditions", "source_evidence_refs", "valid_from"}))
             _protocol(body)
             call_id: str = _request_id(body)
+            explicit_id = body.get("request_id")
             request = dict(body)
-            request.pop("request_id", None)
+            if explicit_id is None:
+                # Auto-generated envelope ids are echo-only; only caller-supplied
+                # ids enter Core (otherwise every call writes a receipt row).
+                request.pop("request_id", None)
             # The stdio server has no attested Codex user turn.  Keep the
             # adapter origin as memory_reinjection; Core still requires its
             # own human evidence and expected revision before changing state.

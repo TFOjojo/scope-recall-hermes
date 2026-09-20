@@ -33,6 +33,7 @@ class MutationReceipt:
     items: tuple[Mutation, ...]
     memory_epoch: int
     durability: str = "persisted"
+    replayed: bool = False
 
 
 def evidence_refs(proposal: ClaimProposal) -> tuple[str, ...]:
@@ -268,7 +269,19 @@ def _source_principal_ref(source) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _revise_in_transaction(tx, clock, request, *, source=None) -> Mutation:
+def _revise_in_transaction(tx, clock, request, *, source=None) -> tuple[Mutation, bool]:
+    # Idempotent replay gate: must run before the head CAS check below,
+    # because a replayed request sees head.current_revision > expected.
+    request_id = request.get("request_id")
+    receipt_key = payload_digest = None
+    if request_id:
+        receipts = tx.receipts
+        receipt_key, _ = receipts.request_key(request_id)
+        payload_digest = receipts.payload_digest(request)
+        archived = receipts.find(receipt_key, payload_digest)
+        if archived is not None:
+            return (Mutation(archived["claim_ref"], archived["claim_revision"],
+                             archived["disposition"], archived["state"]), True)
     history = tx.claims.versions(request["target_ref"])
     if not history:
         raise ContractError("SOURCE_MISSING")
@@ -345,7 +358,12 @@ def _revise_in_transaction(tx, clock, request, *, source=None) -> Mutation:
         if qualification.state != "active":
             raise ContractError("DERIVATION_INVALID", qualification.reason)
     if same_assertion(head.payload,updated) and head.state == qualification.state:
-        return Mutation(head.ref,head.revision,"duplicate",head.state)
+        mutation = Mutation(head.ref,head.revision,"duplicate",head.state)
+        if receipt_key is not None:
+            tx.receipts.record(receipt_key, request_id, payload_digest, mutation.ref,
+                               mutation.revision, mutation.disposition,
+                               mutation.state, clock.utc_now())
+        return (mutation, False)
     same_conditions = sorted(set(head.payload["conditions"])) == sorted(set(updated["conditions"]))
     if not same_conditions:
         if retraction:
@@ -353,27 +371,35 @@ def _revise_in_transaction(tx, clock, request, *, source=None) -> Mutation:
         now = clock.utc_now()
         mutation = apply_claim(tx,updated,head.scope_id,now,
                                _subject_bound=principal_matches)
+        if receipt_key is not None:
+            tx.receipts.record(receipt_key, request_id, payload_digest, mutation.ref,
+                               mutation.revision, mutation.disposition,
+                               mutation.state, now)
         register_applied_candidate(tx, mutation, now)
         tx.claims.resolve_updates(mutation.ref, resolved_at=now)
-        return mutation
+        return (mutation, False)
     now = clock.utc_now()
     saved = tx.claims.append(head.scope_id,updated,qualification,recorded_at=now,previous=head,
                             expected_revision=request["expected_revision"])
     mutation = Mutation(saved.ref,saved.revision,"retracted" if retraction else "revised",saved.state)
+    if receipt_key is not None:
+        tx.receipts.record(receipt_key, request_id, payload_digest, mutation.ref,
+                           mutation.revision, mutation.disposition,
+                           mutation.state, now)
     register_applied_candidate(tx, mutation, now)
     # The ambiguity this claim was a candidate for has now been answered by an
     # authorized revision of it.  Without this, ``unresolved_updates`` only ever
     # grew: ``resolved`` had no writer anywhere in the codebase.
     tx.claims.resolve_updates(mutation.ref, resolved_at=now)
-    return mutation
+    return (mutation, False)
 
 
 def revise(storage, clock, context: TrustedContext, value, *, remaining_seconds: float = 1.0) -> MutationReceipt:
     request = validate_model_request("revise_request",value,context)
     with storage.write(context, remaining_seconds=remaining_seconds) as tx:
-        item = _revise_in_transaction(tx,clock,request)
+        item, replayed = _revise_in_transaction(tx,clock,request)
         epoch = tx.status().memory_epoch
-    return MutationReceipt((item,),epoch)
+    return MutationReceipt((item,),epoch,replayed=replayed)
 
 
 def capture_correction(tx, source, clock) -> Mutation | None:
@@ -425,7 +451,8 @@ def capture_correction(tx, source, clock) -> Mutation | None:
                        source_evidence_refs=[f"{source.ref}@{source.revision}"],valid_from=source.event["occurred_at"])
         try:
             with tx.savepoint():
-                return _revise_in_transaction(tx,clock,request)
+                mutation, _ = _revise_in_transaction(tx,clock,request)
+                return mutation
         except ContractError:
             # Rejected semantics do not discard the user's captured occurrence.
             pass

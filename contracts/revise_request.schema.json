@@ -53,6 +53,11 @@
         "null"
       ],
       "format": "date-time"
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
     }
   },
   "required": [

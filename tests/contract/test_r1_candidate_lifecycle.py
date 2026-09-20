@@ -510,6 +510,44 @@ def test_r1_candidate_scheduler_distinguishes_missing_capability_and_daily_budge
     assert uncapped.reason != "daily_queue_budget"
 
 
+def _mutation_receipts_table(conn):
+    """(name, column-count) of the receipts table, or None when absent."""
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='mutation_receipts'"
+    ).fetchone()
+    if row is None:
+        return None
+    cols = conn.execute("PRAGMA table_info(mutation_receipts)").fetchall()
+    return row[0], len(cols)
+
+
+def test_mutation_receipts_upgrade_is_idempotent_and_derived_from_named_statement(app):
+    """1108->1109 upgrade must be rerunnable and its statements never empty.
+
+    A substring-derived statement tuple goes silently empty whenever the DDL
+    wording changes, and the upgrade then writes the version without creating
+    the table. Both failure modes are locked here.
+    """
+    import scope_recall.core.schema as schema_module
+
+    core, _ctx = app
+    with sqlite3.connect(core.storage.path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 1109
+        before = _mutation_receipts_table(conn)
+        assert before == ("mutation_receipts", 12), f"receipts table shape: {before}"
+        statements = schema_module.MUTATION_RECEIPT_STATEMENTS
+        assert statements, "derived receipt migration statements must not be empty"
+        assert statements == (schema_module.MUTATION_RECEIPT_TABLE_STATEMENT,), (
+            "upgrade must reuse the same statement object as fresh initialization"
+        )
+        for _ in range(3):
+            schema_module.upgrade_1108(conn)
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 1109
+            assert _mutation_receipts_table(conn) == before
+            assert conn.execute(
+                "SELECT count(*) FROM mutation_receipts").fetchone()[0] == 0
+
+
 def test_r1_candidate_1107_migration_preserves_work_ids_leases_and_error_history(app, monkeypatch):
     core, ctx = app
     source = capture(core, ctx, "TEST migration durable work。", key="TEST-r1/migration")
@@ -558,7 +596,11 @@ def test_r1_candidate_1107_migration_preserves_work_ids_leases_and_error_history
     monkeypatch.setattr(storage_module, "upgrade_1107", original)
     status = core.initialize()
     with sqlite3.connect(core.storage.path) as conn:
-        assert status.schema_version == SCHEMA_VERSION == 1108
+        assert status.schema_version == SCHEMA_VERSION == 1109
+        # 版本号绿不等于表在：早期该断言只比版本号，迁移函数空转也放行。
+        assert _mutation_receipts_table(conn), (
+            "1107 库升级后 mutation_receipts 表缺失（迁移语句派生为空）"
+        )
         assert conn.execute("SELECT state,attempt,lease_token,lease_owner,last_error_code FROM work_items WHERE work_id=?", (work_id,)).fetchone() == (
             "leased", 2, 7, "TEST-owner", "held",
         )

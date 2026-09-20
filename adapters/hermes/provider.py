@@ -1235,8 +1235,12 @@ class ScopeRecallHermesAdapter(_MemoryProviderBase):  # pyright: ignore[reportGe
         )
         _check_tool_protocol(body)
         request_id = _tool_request_id(body)
+        explicit_id = body.get("request_id")
         request = dict(body)
-        request.pop("request_id", None)
+        if explicit_id is None:
+            # Auto-generated envelope ids are echo-only; only caller-supplied
+            # ids enter Core (otherwise every call writes a receipt row).
+            request.pop("request_id", None)
         # Core remains the only authority for current human evidence,
         # expected revisions, scope, and transaction/receipt semantics.
         receipt = self._require_core().revise(context, request, remaining_seconds=1.0)

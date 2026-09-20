@@ -330,6 +330,100 @@ def test_explicit_revision_compare_and_swap_and_no_silent_retries(app):
     assert core.storage.path.read_bytes() == before
 
 
+def test_request_id_replay_returns_replayed_not_duplicated(app):
+    """同 request_id + 同载荷重放 → replayed=True，不新增版本，库字节不变。"""
+    core,ctx = app
+    item,_ = initial(core,ctx)
+    source = capture(core,ctx,"Please correct TEST-project 配色: 银色。",when="2026-09-03T12:00:00Z")
+    request = revise_request(item,source,request_id="req-replay-1")
+    first = core.revise(ctx,request,remaining_seconds=10)
+    assert first.replayed is False
+    assert first.items[0].revision == 2
+    before = core.storage.path.read_bytes()
+    second = core.revise(ctx,request,remaining_seconds=10)
+    assert second.replayed is True, "同载荷重放未标记 replayed"
+    assert second.items[0].revision == 2
+    assert second.items[0].disposition == "revised"
+    assert len(core.claim_history(ctx,item.ref)) == 2, "重放产生重复事实"
+    assert core.storage.path.read_bytes() == before
+
+
+def test_request_id_reuse_with_different_payload_conflicts(app):
+    """同 request_id + 异载荷 → REQUEST_ID_REUSED（不是 VERSION_CONFLICT）。"""
+    core,ctx = app
+    item,_ = initial(core,ctx)
+    source = capture(core,ctx,"Please correct TEST-project 配色: 银色。",when="2026-09-03T12:00:00Z")
+    request = revise_request(item,source,request_id="req-reuse-1")
+    core.revise(ctx,request,remaining_seconds=10)
+    mutated = dict(request)
+    mutated["new_value"] = "金色"
+    with pytest.raises(ContractError,match="REQUEST_ID_REUSED"):
+        core.revise(ctx,mutated,remaining_seconds=10)
+
+
+def test_request_id_replay_across_restart_matches_committed_outcome(app):
+    """回执跨重启持久：同 request_id 重放返回与首次一致的结果。"""
+    core,ctx = app
+    item,_ = initial(core,ctx)
+    source = capture(core,ctx,"Please correct TEST-project 配色: 银色。",when="2026-09-03T12:00:00Z")
+    request = revise_request(item,source,request_id="req-replay-2")
+    first = core.revise(ctx,request,remaining_seconds=10)
+    assert first.items[0].revision == 2
+    # 重建 core 实例（模拟重启）后重放，仍返回存档结果
+    core2 = MemoryCore(CoreConfig(ctx.binding),clock=Clock())
+    core2.initialize()
+    second = core2.revise(ctx,request,remaining_seconds=10)
+    assert second.replayed is True
+    assert second.items[0].revision == 2
+    assert second.items[0].disposition == "revised"
+
+
+def test_request_id_replay_covers_duplicate_branch(app):
+    """duplicate 分支（same_assertion 命中）也落回执：重放 replayed=True、库字节不变。
+
+    构造对齐 reviews/p2final_probe_duplicate.py：修正源单独 capture 且原文含新值，
+    valid_from 保持初始源时间（值/条件/valid_from 全同 → same_assertion）。
+    """
+    core,ctx = app
+    item,item_src = initial(core,ctx,statement_kind="assertion")
+    src2 = capture(core,ctx,"Please correct TEST-project 配色: 蓝色。",when=item_src.event["occurred_at"])
+    request = revise_request(item,src2,value="蓝色",request_id="req-dup-1",
+        valid_from=item_src.event["occurred_at"])
+    first = core.revise(ctx,request,remaining_seconds=10)
+    assert first.items[0].disposition == "duplicate"
+    assert first.replayed is False
+    before = core.storage.path.read_bytes()
+    second = core.revise(ctx,request,remaining_seconds=10)
+    assert second.replayed is True, "duplicate 分支重放未标记 replayed"
+    assert second.items[0].disposition == "duplicate"
+    assert second.items[0].revision == first.items[0].revision
+    assert core.storage.path.read_bytes() == before, "duplicate 分支重放写了库"
+    assert len(core.claim_history(ctx,item.ref)) == 1, "duplicate 分支重放产生新版本"
+
+
+def test_request_id_replay_covers_conditions_change_branch(app):
+    """conditions 变更分支（apply_claim 路径）也落回执：重放幂等、库字节不变。
+
+    构造对齐 reviews/p2final_probe_conditions.py：修正源含"只限TEST沙箱"新条件，
+    conditions 用字符串列表 → same_conditions 为假 → apply_claim 分支。
+    """
+    core,ctx = app
+    item,_ = initial(core,ctx,statement_kind="assertion")
+    src2 = capture(core,ctx,"Please correct TEST-project 配色: 银色，只限TEST沙箱。",when="2026-09-03T12:00:00Z")
+    request = revise_request(item,src2,value="银色",conditions=["TEST沙箱"],request_id="req-cond-1",
+        valid_from=src2.event["occurred_at"])
+    first = core.revise(ctx,request,remaining_seconds=10)
+    assert first.items[0].disposition == "inserted", first.items[0].disposition
+    assert first.replayed is False
+    before = core.storage.path.read_bytes()
+    second = core.revise(ctx,request,remaining_seconds=10)
+    assert second.replayed is True, "conditions 变更分支重放未标记 replayed"
+    assert second.items[0].revision == first.items[0].revision
+    assert second.items[0].disposition == first.items[0].disposition
+    assert core.storage.path.read_bytes() == before, "conditions 变更分支重放写了库"
+    assert len(core.claim_history(ctx,item.ref)) == 1, "conditions 变更分支重放产生新版本"
+
+
 def test_two_real_writers_with_same_expected_revision_have_exactly_one_winner(app):
     core,ctx = app
     item,_ = initial(core,ctx)

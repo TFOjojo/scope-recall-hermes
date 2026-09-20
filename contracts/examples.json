@@ -60,7 +60,8 @@
     "source_evidence_refs": [
       "event:test-2@1"
     ],
-    "valid_from": "2026-09-02T08:00:00Z"
+    "valid_from": "2026-09-02T08:00:00Z",
+    "request_id": "hermes-tool:3f2a1c9e0d8b4a5e"
   },
   "forget_request": {
     "protocol_version": "1.1",

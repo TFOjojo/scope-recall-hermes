@@ -85,6 +85,7 @@
     "core/index_rebuild.py",
     "core/inspect_service.py",
     "core/mutate.py",
+    "core/mutate_receipts.py",
     "core/read_views.py",
     "core/recall.py",
     "core/recall_diagnostics.py",
